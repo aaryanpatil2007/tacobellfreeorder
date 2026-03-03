@@ -2,8 +2,9 @@
 Disposable email helper for Taco Bell OTP sign-in.
 
 Providers (tried in order):
-  1. mail.tm   – REST API, no browser, good deliverability
-  2. 1secmail  – Ultra-simple API, large domain pool
+  1. mail.tm       – REST API, no browser, good deliverability
+  2. 1secmail      – Ultra-simple API, large domain pool
+  3. guerrillamail – Session-based API, reliable fallback
 
 Public API
 ----------
@@ -24,10 +25,11 @@ import requests
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
-MAILTM_BASE = "https://api.mail.tm"
-ONESEC_BASE = "https://www.1secmail.com/api/v1/"
+MAILTM_BASE    = "https://api.mail.tm"
+ONESEC_BASE    = "https://www.1secmail.com/api/v1/"
+GUERRILLA_API  = "https://api.guerrillamail.com/ajax.php"
 
-DEFAULT_PROVIDERS = ["mailtm", "1secmail"]
+DEFAULT_PROVIDERS = ["mailtm", "1secmail", "guerrillamail"]
 
 
 # ─── HTML stripping ───────────────────────────────────────────────────────────
@@ -199,6 +201,58 @@ def _onesec_poll(tok, timeout, interval):
     raise TimeoutError("No verification email received within timeout.")
 
 
+# ─── Guerrilla Mail provider ─────────────────────────────────────────────────
+
+def _guerrilla_create():
+    """Create a Guerrilla Mail inbox. Returns (email, token_dict)."""
+    r = requests.get(GUERRILLA_API, params={"f": "get_email_address"}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    email = data["email_addr"]
+    sid = data["sid_token"]
+    return email, {"provider": "guerrillamail", "sid": sid}
+
+
+def _guerrilla_poll(tok, timeout, interval):
+    sid = tok["sid"]
+    deadline = time.time() + timeout
+    seen = set()
+
+    while time.time() < deadline:
+        try:
+            r = requests.get(
+                GUERRILLA_API,
+                params={"f": "check_email", "sid_token": sid, "seq": 0},
+                timeout=10,
+            )
+            r.raise_for_status()
+            for msg in r.json().get("list", []):
+                mid = str(msg.get("mail_id", ""))
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+
+                r2 = requests.get(
+                    GUERRILLA_API,
+                    params={"f": "fetch_email", "sid_token": sid, "email_id": mid},
+                    timeout=10,
+                )
+                r2.raise_for_status()
+                data = r2.json()
+                combined = data.get("mail_body", "") + " " + data.get("mail_excerpt", "")
+                code = _find_code(combined)
+                if code:
+                    yield ("code", code)
+                    return
+        except Exception:
+            pass
+
+        yield ("waiting", None)
+        time.sleep(interval)
+
+    raise TimeoutError("No verification email received within timeout.")
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def create_account(providers=None):
@@ -225,6 +279,8 @@ def create_account(providers=None):
                 return _mailtm_create()
             elif name == "1secmail":
                 return _onesec_create()
+            elif name == "guerrillamail":
+                return _guerrilla_create()
         except Exception as e:
             last_err = e
             continue
@@ -243,5 +299,7 @@ def poll_for_code(token, timeout=180, interval=4):
         yield from _mailtm_poll(token, timeout, interval)
     elif provider == "1secmail":
         yield from _onesec_poll(token, timeout, interval)
+    elif provider == "guerrillamail":
+        yield from _guerrilla_poll(token, timeout, interval)
     else:
         raise ValueError(f"Unknown provider: {provider!r}")
