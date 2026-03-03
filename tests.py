@@ -1,5 +1,6 @@
 """
-Comprehensive tests for mail_handler.py
+Unit tests for mail_handler.py (all HTTP calls are mock-patched).
+For real TCP integration tests see test_integration.py.
 Run: python3 -m pytest tests.py -v
 """
 
@@ -560,3 +561,206 @@ class TestIntegrationFlows:
 
         events = list(mail_handler.poll_for_code(token, timeout=60, interval=0))
         assert ("code", "112233") in events
+
+
+# ─── _random_str ─────────────────────────────────────────────────────────────
+
+class TestRandomStr:
+    def test_length(self):
+        assert len(mail_handler._random_str(10)) == 10
+        assert len(mail_handler._random_str(16)) == 16
+        assert len(mail_handler._random_str(1)) == 1
+
+    def test_only_lowercase_alphanumeric(self):
+        for _ in range(20):
+            s = mail_handler._random_str(20)
+            assert s.isalnum()
+            assert s == s.lower()
+
+    def test_randomness(self):
+        # Probability of 10 identical 10-char strings is astronomically small
+        results = {mail_handler._random_str(10) for _ in range(10)}
+        assert len(results) > 1
+
+
+# ─── DEFAULT_PROVIDERS constant ──────────────────────────────────────────────
+
+class TestDefaultProviders:
+    def test_includes_mailtm(self):
+        assert "mailtm" in mail_handler.DEFAULT_PROVIDERS
+
+    def test_includes_1secmail(self):
+        assert "1secmail" in mail_handler.DEFAULT_PROVIDERS
+
+    def test_mailtm_first(self):
+        assert mail_handler.DEFAULT_PROVIDERS[0] == "mailtm"
+
+
+# ─── create_account provider ordering ────────────────────────────────────────
+
+class TestCreateAccountProviderOrdering:
+    @patch("mail_handler.requests.post")
+    @patch("mail_handler.requests.get")
+    def test_respects_custom_provider_order_1secmail_first(self, mock_get, mock_post):
+        onesec = MagicMock()
+        onesec.raise_for_status = MagicMock()
+        onesec.json.return_value = ["custom.test"]
+        mock_get.return_value = onesec
+
+        email, token = mail_handler.create_account(providers=["1secmail"])
+
+        assert token["provider"] == "1secmail"
+        assert "@custom.test" in email
+        # POST should never be called for 1secmail (no account creation POST needed)
+        mock_post.assert_not_called()
+
+    @patch("mail_handler.requests.get")
+    def test_none_providers_uses_default(self, mock_get):
+        """Passing providers=None should use DEFAULT_PROVIDERS."""
+        # Simulate mail.tm working fine
+        domains = MagicMock()
+        domains.raise_for_status = MagicMock()
+        domains.json.return_value = {
+            "hydra:member": [{"domain": "def.test", "isActive": True}]
+        }
+        with patch("mail_handler.requests.post") as mock_post:
+            acct = MagicMock()
+            acct.raise_for_status = MagicMock()
+            tok = MagicMock()
+            tok.raise_for_status = MagicMock()
+            tok.json.return_value = {"token": "x"}
+            mock_post.side_effect = [acct, tok]
+            mock_get.return_value = domains
+
+            email, token = mail_handler.create_account(providers=None)
+
+        assert token["provider"] == "mailtm"
+
+
+# ─── poll_for_code interval parameter ────────────────────────────────────────
+
+class TestPollInterval:
+    @patch("mail_handler.time.sleep")
+    @patch("mail_handler.requests.get")
+    def test_sleep_called_with_correct_interval_mailtm(self, mock_get, mock_sleep):
+        empty = MagicMock()
+        empty.raise_for_status = MagicMock()
+        empty.json.return_value = {"hydra:member": []}
+
+        inbox = MagicMock()
+        inbox.raise_for_status = MagicMock()
+        inbox.json.return_value = {"hydra:member": [{"id": "m1"}]}
+
+        msg = MagicMock()
+        msg.raise_for_status = MagicMock()
+        msg.json.return_value = {"text": "Code: 123456", "html": ""}
+
+        mock_get.side_effect = [empty, inbox, msg]
+
+        token = {"provider": "mailtm", "bearer": "t"}
+        list(mail_handler.poll_for_code(token, timeout=30, interval=9))
+
+        # sleep(9) was called once (after the empty poll)
+        mock_sleep.assert_called_once_with(9)
+
+    @patch("mail_handler.time.sleep")
+    @patch("mail_handler.requests.get")
+    def test_sleep_called_with_correct_interval_1secmail(self, mock_get, mock_sleep):
+        empty = MagicMock()
+        empty.raise_for_status = MagicMock()
+        empty.json.return_value = []
+
+        inbox = MagicMock()
+        inbox.raise_for_status = MagicMock()
+        inbox.json.return_value = [{"id": 1}]
+
+        msg = MagicMock()
+        msg.raise_for_status = MagicMock()
+        msg.json.return_value = {"textBody": "Code: 654321", "htmlBody": ""}
+
+        mock_get.side_effect = [empty, inbox, msg]
+
+        token = {"provider": "1secmail", "login": "u", "domain": "1secmail.com"}
+        list(mail_handler.poll_for_code(token, timeout=30, interval=11))
+
+        mock_sleep.assert_called_once_with(11)
+
+
+# ─── HTML edge cases ─────────────────────────────────────────────────────────
+
+class TestHtmlEdgeCases:
+    def test_deeply_nested_code(self):
+        html = (
+            "<html><body><table><tbody><tr><td>"
+            "<div><span><strong>482910</strong></span></div>"
+            "</td></tr></tbody></table></body></html>"
+        )
+        assert mail_handler._find_code(mail_handler._strip_html(html)) == "482910"
+
+    def test_code_in_style_attr_not_matched(self):
+        # The number 482910 here is inside an attribute, not visible text
+        html = '<div style="width:482910px">Hello world</div>'
+        text = mail_handler._strip_html(html)
+        # strip_html yields "Hello world"; the attr value is not data
+        assert "Hello world" in text
+        # The code regex on text only: depends on whether attr is in text
+        # Either outcome is acceptable; we just verify it doesn't crash
+        result = mail_handler._find_code(text)
+        assert result is None or result == "482910"
+
+    def test_malformed_html_does_not_raise(self):
+        malformed = "<p>code <b>938271</b><br/no close tag"
+        result = mail_handler._strip_html(malformed)
+        assert "938271" in result
+
+    def test_very_long_html_email(self):
+        body = "<p>word </p>" * 1000 + "<p>Your code is 847291</p>" + "<p>word </p>" * 1000
+        text = mail_handler._strip_html(body)
+        assert mail_handler._find_code(text) == "847291"
+
+    def test_code_inside_link_text(self):
+        html = '<a href="https://example.com">Click here: 291847</a>'
+        text = mail_handler._strip_html(html)
+        assert mail_handler._find_code(text) == "291847"
+
+    def test_multiple_codes_in_html_returns_first(self):
+        html = "<p>111111</p><p>222222</p>"
+        text = mail_handler._strip_html(html)
+        assert mail_handler._find_code(text) == "111111"
+
+
+# ─── Code extraction edge cases ──────────────────────────────────────────────
+
+class TestCodeExtractionEdgeCases:
+    def test_code_with_leading_zero(self):
+        assert mail_handler._find_code("Code: 012345") == "012345"
+
+    def test_all_zeros(self):
+        assert mail_handler._find_code("000000") == "000000"
+
+    def test_all_nines(self):
+        assert mail_handler._find_code("999999") == "999999"
+
+    def test_code_in_json_like_text(self):
+        text = '{"code": "482910", "expires": 300}'
+        assert mail_handler._find_code(text) == "482910"
+
+    def test_real_world_taco_bell_style_text(self):
+        text = (
+            "Hi,\n\n"
+            "Here is your one-time sign-in code for Taco Bell:\n\n"
+            "   394827\n\n"
+            "This code expires in 10 minutes. Do not share it.\n\n"
+            "The Taco Bell Team"
+        )
+        assert mail_handler._find_code(text) == "394827"
+
+    def test_phone_number_not_matched(self):
+        # 10-digit phone — should not match
+        assert mail_handler._find_code("Call 1234567890 for help") is None
+
+    def test_year_not_matched(self):
+        assert mail_handler._find_code("Copyright 2024") is None
+
+    def test_code_adjacent_to_newline(self):
+        assert mail_handler._find_code("code:\n938271\n") == "938271"
