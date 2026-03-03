@@ -77,79 +77,119 @@ async def get_temp_email(page: Page) -> str:
     raise RuntimeError("temp-mail.org did not generate an email in time")
 
 
-async def poll_tempmail(page: Page, timeout: int = TIMEOUT) -> tuple:
+async def poll_tempmail(page: Page, email: str, timeout: int = TIMEOUT) -> tuple:
     """
-    Reload temp-mail.org inbox until a 6-digit code or verification link appears.
+    Reload temp-mail.org and scan inbox for the verification email.
     Returns ("code", "123456") or ("link", "https://…").
     """
     seen: set = set()
     deadline = time.time() + timeout
 
-    MSG_SELECTORS = [
-        ".inbox-dataList .message",
-        ".inbox-dataList li",
-        ".mail-list .mail-item",
-        "[class*='inbox'] li[class*='message']",
-        "[class*='message-item']",
-        "li[onclick]",
-    ]
-
     print("  ", end="", flush=True)
 
     while time.time() < deadline:
         try:
-            await page.reload(wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(2)
+            await page.reload(wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(3)
             await dismiss_overlays(page)
 
-            for sel in MSG_SELECTORS:
-                items = page.locator(sel)
-                count = await items.count()
-                if count == 0:
+            # Use JS to find inbox items with real email content.
+            # We filter out empty placeholders and column headers (short/single words).
+            inbox_items = await page.evaluate("""
+                () => {
+                    const HEADERS = new Set(['sender','subject','view','date','from','received','inbox']);
+                    const selectors = [
+                        '.inbox-dataList li',
+                        '.inbox-dataList .message',
+                        '[class*="message-item"]',
+                    ];
+                    for (const sel of selectors) {
+                        const items = [...document.querySelectorAll(sel)];
+                        const found = items
+                            .map((el, i) => ({
+                                index: i,
+                                sel: sel,
+                                text: (el.innerText || '').trim().slice(0, 120)
+                            }))
+                            .filter(x => {
+                                const t = x.text;
+                                if (t.length < 15) return false;  // too short = placeholder
+                                const lower = t.toLowerCase();
+                                // single-word column headers
+                                if (HEADERS.has(lower)) return false;
+                                return true;
+                            });
+                        if (found.length) return found;
+                    }
+                    return [];
+                }
+            """)
+
+            for item in inbox_items:
+                key = item["text"][:60]
+                if key in seen:
                     continue
+                seen.add(key)
 
-                for i in range(count):
-                    item = items.nth(i)
+                print(f"\n  [email found: {key[:50]}]", end="", flush=True)
+
+                try:
+                    await page.locator(item["sel"]).nth(item["index"]).click()
+                    # Wait for email content to fully render
                     try:
-                        label = (await item.inner_text()).strip()[:120]
+                        await page.wait_for_load_state("networkidle", timeout=8000)
                     except Exception:
-                        continue
+                        pass
+                    await asyncio.sleep(3)
 
-                    if label in seen:
-                        continue
-                    seen.add(label)
+                    # Collect text from main page + all iframes
+                    combined = await page.inner_text("body")
+                    combined += "\n" + await page.content()  # raw HTML too
+                    for frame in page.frames[1:]:
+                        try:
+                            combined += "\n" + await frame.inner_text("body")
+                            combined += "\n" + await frame.content()
+                        except Exception:
+                            pass
 
-                    try:
-                        await item.click()
-                        await asyncio.sleep(3)
-                    except Exception:
-                        continue
-
-                    try:
-                        body = await page.inner_text("body")
-                    except Exception:
-                        body = ""
-
-                    m = re.search(r"\b(\d{6})\b", body)
+                    # 6-digit code
+                    m = re.search(r"\b(\d{6})\b", combined)
                     if m:
                         print()
                         return "code", m.group(1)
 
+                    # Verification / activation link (broad match)
                     m2 = re.search(
-                        r'https?://[^\s"\'<>]*(verif|confirm|activ|account)[^\s"\'<>]*',
-                        body, re.IGNORECASE,
+                        r'https?://[^\s"\'<>]+'
+                        r'(?:verif|confirm|activ|account|click|token|magic)[^\s"\'<>]*',
+                        combined, re.IGNORECASE,
                     )
                     if m2:
                         print()
                         return "link", m2.group(0)
 
+                    # Any tacobell / yum link as last resort
+                    m3 = re.search(
+                        r'https?://[^\s"\'<>]*(?:tacobell|yum\.com)[^\s"\'<>]*',
+                        combined, re.IGNORECASE,
+                    )
+                    if m3:
+                        print()
+                        return "link", m3.group(0)
+
+                    # Didn't find a code — navigate back
                     try:
                         await page.go_back()
                     except Exception:
                         await page.goto(TEMPMAIL_URL, wait_until="domcontentloaded")
                     await asyncio.sleep(2)
 
-                break  # found working selector
+                except Exception as e:
+                    print(f"\n  [error opening email: {e}]", end="", flush=True)
+                    try:
+                        await page.goto(TEMPMAIL_URL, wait_until="domcontentloaded")
+                    except Exception:
+                        pass
 
         except Exception:
             pass
@@ -219,7 +259,7 @@ async def main() -> None:
         print("[ 3 / 3 ]  Monitoring inbox (checking every 5 s, up to 5 min)...")
         print()
 
-        result_type, result_value = await poll_tempmail(page, timeout=TIMEOUT)
+        result_type, result_value = await poll_tempmail(page, email, timeout=TIMEOUT)
         await browser.close()
 
     # ── Display result ─────────────────────────────────────────
