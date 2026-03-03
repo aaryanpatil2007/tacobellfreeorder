@@ -1,61 +1,28 @@
 """
 Taco Bell Free Order Helper
 ────────────────────────────
-1. Creates a disposable email via Guerrilla Mail API (no browser needed)
-2. Opens Taco Bell sign-up in your REAL browser (no bot detection)
-3. Polls Guerrilla Mail inbox via API every 5 seconds
-4. Displays the verification code the moment it arrives
+1. Creates a disposable email via mail.tm or 1secmail (no browser needed)
+2. Opens the Taco Bell sign-in page in your real browser (no bot detection)
+3. Polls the disposable inbox via API every 4 seconds
+4. Displays the 6-digit OTP the moment it arrives
 """
 
-import re
-import subprocess
 import platform
+import subprocess
 import sys
 import time
-import requests
 
-GUERRILLA_API = "https://api.guerrillamail.com/ajax.php"
-REGISTER_URL  = "https://www.tacobell.com/register/yum"
-POLL_INTERVAL = 5    # seconds between inbox checks
-TIMEOUT       = 300  # 5 minutes
+import mail_handler
 
-
-# ─── email helpers ──────────────────────────────────────────────────────────────
-
-def gen_email() -> tuple:
-    """Get a fresh Guerrilla Mail address and session token."""
-    r = requests.get(GUERRILLA_API, params={"f": "get_email_address"}, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    email = data["email_addr"]
-    token = data["sid_token"]
-    return email, token
+SIGNIN_URL = "https://www.tacobell.com/login"
+TIMEOUT = 300   # 5 minutes
+INTERVAL = 4    # seconds between inbox checks
 
 
-def check_inbox(token: str, seq: int = 0) -> list:
-    r = requests.get(
-        GUERRILLA_API,
-        params={"f": "check_email", "sid_token": token, "seq": seq},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json().get("list", [])
-
-
-def fetch_email(token: str, email_id: str) -> str:
-    r = requests.get(
-        GUERRILLA_API,
-        params={"f": "fetch_email", "sid_token": token, "email_id": email_id},
-        timeout=10,
-    )
-    r.raise_for_status()
-    data = r.json()
-    return data.get("mail_body", "") + " " + data.get("mail_excerpt", "")
-
-
-# ─── browser opener ─────────────────────────────────────────────────────────────
+# ─── Utilities ───────────────────────────────────────────────────────────────
 
 def open_url(url: str) -> None:
+    """Open a URL in the default system browser."""
     try:
         system = platform.system()
         if system == "Darwin":
@@ -68,118 +35,90 @@ def open_url(url: str) -> None:
         pass
 
 
-# ─── inbox poller ───────────────────────────────────────────────────────────────
-
-def poll_for_code(token: str, timeout: int = TIMEOUT) -> tuple:
-    """
-    Poll Guerrilla Mail until a 6-digit code or verification link appears.
-    Returns ("code", "123456") or ("link", "https://…").
-    """
-    seen: set = set()
-    deadline = time.time() + timeout
-
-    print("  ", end="", flush=True)
-
-    while time.time() < deadline:
-        try:
-            msgs = check_inbox(token)
-            for msg in msgs:
-                mid = str(msg.get("mail_id", ""))
-                if not mid or mid in seen:
-                    continue
-                seen.add(mid)
-
-                body = fetch_email(token, mid)
-
-                # 6-digit verification code?
-                m = re.search(r"\b(\d{6})\b", body)
-                if m:
-                    print()
-                    return "code", m.group(1)
-
-                # Verification/activation link?
-                m2 = re.search(
-                    r'https?://[^\s"\'<>]*(verif|confirm|activ|account)[^\s"\'<>]*',
-                    body,
-                    re.IGNORECASE,
-                )
-                if m2:
-                    print()
-                    return "link", m2.group(0)
-
-        except Exception:
-            pass  # network hiccup — keep going
-
-        print(".", end="", flush=True)
-        time.sleep(POLL_INTERVAL)
-
-    raise TimeoutError
-
-
-# ─── main ───────────────────────────────────────────────────────────────────────
+# ─── Main flow ────────────────────────────────────────────────────────────────
 
 def main() -> None:
     print()
-    print("=" * 50)
+    print("=" * 54)
     print("   Taco Bell Free Order Helper")
-    print("=" * 50)
+    print("=" * 54)
     print()
 
-    # ── Step 1: generate temp email ────────────────────
+    # ── Step 1: generate disposable email ────────────────────
     print("[ 1 / 3 ]  Generating disposable email...")
-    email, token = gen_email()
+    try:
+        email, token = mail_handler.create_account()
+    except RuntimeError as e:
+        print(f"\n   ERROR: Could not create temp email – {e}")
+        sys.exit(1)
+
+    provider = token.get("provider", "unknown")
     print()
     print("   YOUR EMAIL:")
     print(f"   >>> {email} <<<")
+    print(f"   (via {provider})")
     print()
 
-    # ── Step 2: open Taco Bell in real browser ─────────
-    print("[ 2 / 3 ]  Opening Taco Bell sign-up in your browser...")
-    open_url(REGISTER_URL)
-    print()
-    print("  ┌──────────────────────────────────────────────────┐")
-    print("  │  In the browser window that just opened:         │")
-    print("  │                                                  │")
-    print("  │  1. Accept cookies if prompted                   │")
-    print("  │  2. Enter this email:                            │")
-    print(f"  │     {email:<46}  │")
-    print("  │  3. Click CONFIRM, fill name + password, submit  │")
-    print("  │                                                  │")
-    print("  │  Inbox is checked automatically every 5 seconds! │")
-    print("  └──────────────────────────────────────────────────┘")
+    # ── Step 2: open Taco Bell sign-in in real browser ────────
+    print("[ 2 / 3 ]  Opening Taco Bell sign-in in your browser...")
+    open_url(SIGNIN_URL)
     print()
 
-    # ── Step 3: poll inbox ─────────────────────────────
-    print("[ 3 / 3 ]  Monitoring inbox (checking every 5 s, up to 5 min)...")
+    pad = max(0, 50 - len(email))
+    print("  ┌──────────────────────────────────────────────────────┐")
+    print("  │  In the browser window that just opened:             │")
+    print("  │                                                       │")
+    print("  │  1. Accept any cookies / prompts                     │")
+    print("  │  2. Enter this email address:                        │")
+    print(f"  │     {email}{' ' * pad}  │")
+    print("  │  3. Click  Continue / Send Code                      │")
+    print("  │                                                       │")
+    print("  │  The inbox is checked automatically every 4 seconds! │")
+    print("  └──────────────────────────────────────────────────────┘")
     print()
 
-    result_type, result_value = poll_for_code(token)
+    # ── Step 3: poll inbox ────────────────────────────────────
+    print(
+        f"[ 3 / 3 ]  Monitoring inbox "
+        f"(checking every {INTERVAL} s, up to 5 min)..."
+    )
+    print("  ", end="", flush=True)
 
-    # ── Display result ─────────────────────────────────
-    print()
-    print("=" * 50)
-    if result_type == "code":
-        print("   VERIFICATION CODE:")
-        print(f"   >>> {result_value} <<<")
-        print("=" * 50)
+    code = None
+    try:
+        for event, value in mail_handler.poll_for_code(
+            token, timeout=TIMEOUT, interval=INTERVAL
+        ):
+            if event == "waiting":
+                print(".", end="", flush=True)
+            elif event == "code":
+                code = value
+                break
+    except TimeoutError:
         print()
-        print("   Enter that code on the Taco Bell site.")
-    else:
-        print("   VERIFICATION LINK — opening in browser...")
-        print("=" * 50)
         print()
-        print(f"   {result_value}")
-        open_url(result_value)
+        print("   ERROR: No verification email arrived after 5 minutes.")
         print()
-        print("   Your account is now being verified.")
+        print("   Tip: If Taco Bell showed a loading spinner when you")
+        print("   entered the email, that domain is blocked. Run the")
+        print("   script again to get a fresh address on a new domain.")
+        sys.exit(1)
+
+    # ── Display result ────────────────────────────────────────
+    print()
+    print()
+    print("=" * 54)
+    print("   VERIFICATION CODE:")
+    print(f"   >>> {code} <<<")
+    print("=" * 54)
+    print()
+    print("   Enter that code in the Taco Bell app or website to sign in.")
     print()
 
 
 if __name__ == "__main__":
     try:
         main()
-    except TimeoutError:
-        print("\n   ERROR: No verification email after 5 minutes. Try running again.")
     except KeyboardInterrupt:
         print("\n   Cancelled.")
     except Exception as e:
