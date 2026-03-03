@@ -18,7 +18,7 @@ from playwright.async_api import async_playwright, Page
 
 REGISTER_URL  = "https://www.tacobell.com/register/yum"
 TEMPMAIL_URL  = "https://temp-mail.org/en/"
-POLL_INTERVAL = 5    # seconds between inbox checks
+POLL_INTERVAL = 3    # seconds between inbox checks
 TIMEOUT       = 300  # 5 minutes
 
 
@@ -77,6 +77,50 @@ async def get_temp_email(page: Page) -> str:
     raise RuntimeError("temp-mail.org did not generate an email in time")
 
 
+# ─── extraction helpers ───────────────────────────────────────────────────────
+
+def _extract(text: str):
+    """
+    Return ("code", val) or ("link", val) if found, else None.
+    Strips spaces between digits to catch "1 2 3 4 5 6" style codes.
+    """
+    # Collapse spaces between single digits (e.g. "1 2 3 4 5 6" → "123456")
+    compact = re.sub(r'(?<=\d)\s(?=\d)', '', text)
+    m = re.search(r'\b(\d{6})\b', compact)
+    if m:
+        return "code", m.group(1)
+
+    for pattern in [
+        r'https?://[^\s"\'<>]+(?:verif|confirm|activ|account|token|magic|click)[^\s"\'<>]*',
+        r'https?://[^\s"\'<>]*(?:tacobell|yum\.com)[^\s"\'<>]+',
+    ]:
+        m2 = re.search(pattern, text, re.IGNORECASE)
+        if m2:
+            return "link", m2.group(0)
+
+    return None
+
+
+async def _read_all(page: Page) -> str:
+    """Read text + HTML from page body and every accessible same-origin iframe."""
+    return await page.evaluate("""
+        () => {
+            let out = (document.body.innerText || '') + '\\n'
+                    + (document.body.innerHTML || '');
+            for (const f of document.querySelectorAll('iframe')) {
+                try {
+                    out += '\\n' + f.contentDocument.body.innerText;
+                    out += '\\n' + f.contentDocument.body.innerHTML;
+                } catch(e) {}
+            }
+            for (const inp of document.querySelectorAll('input')) {
+                if (inp.value) out += '\\n' + inp.value;
+            }
+            return out;
+        }
+    """)
+
+
 async def poll_tempmail(page: Page, email: str, timeout: int = TIMEOUT) -> tuple:
     """
     Reload temp-mail.org and scan inbox for the verification email.
@@ -84,41 +128,49 @@ async def poll_tempmail(page: Page, email: str, timeout: int = TIMEOUT) -> tuple
     """
     seen: set = set()
     deadline = time.time() + timeout
+    captured: list = []
 
+    async def on_response(resp):
+        if "temp-mail.org" not in resp.url:
+            return
+        ct = resp.headers.get("content-type", "")
+        if not ("json" in ct or "html" in ct or "text" in ct):
+            return
+        try:
+            captured.append(await resp.text())
+        except Exception:
+            pass
+
+    page.on("response", on_response)
     print("  ", end="", flush=True)
 
     while time.time() < deadline:
+        captured.clear()
+        inbox_url = page.url
+
         try:
             await page.reload(wait_until="domcontentloaded", timeout=20000)
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
             await dismiss_overlays(page)
 
-            # Use JS to find inbox items with real email content.
-            # We filter out empty placeholders and column headers (short/single words).
+            # Check intercepted responses first (fastest path)
+            for blob in list(captured):
+                result = _extract(blob)
+                if result:
+                    print()
+                    return result
+
+            # Scan inbox DOM for clickable email items
             inbox_items = await page.evaluate("""
                 () => {
-                    const HEADERS = new Set(['sender','subject','view','date','from','received','inbox']);
-                    const selectors = [
-                        '.inbox-dataList li',
-                        '.inbox-dataList .message',
-                        '[class*="message-item"]',
-                    ];
-                    for (const sel of selectors) {
-                        const items = [...document.querySelectorAll(sel)];
-                        const found = items
-                            .map((el, i) => ({
-                                index: i,
-                                sel: sel,
-                                text: (el.innerText || '').trim().slice(0, 120)
-                            }))
-                            .filter(x => {
-                                const t = x.text;
-                                if (t.length < 15) return false;  // too short = placeholder
-                                const lower = t.toLowerCase();
-                                // single-word column headers
-                                if (HEADERS.has(lower)) return false;
-                                return true;
-                            });
+                    const SKIP = new Set(['sender','subject','view','date','from',
+                                         'received','inbox','loading','empty','no messages']);
+                    for (const sel of ['.inbox-dataList li',
+                                       '.inbox-dataList .message',
+                                       '[class*="message-item"]']) {
+                        const found = [...document.querySelectorAll(sel)]
+                            .map((el, i) => ({i, sel, text: (el.innerText||'').trim().slice(0,120)}))
+                            .filter(x => x.text.length >= 15 && !SKIP.has(x.text.toLowerCase()));
                         if (found.length) return found;
                     }
                     return [];
@@ -130,66 +182,45 @@ async def poll_tempmail(page: Page, email: str, timeout: int = TIMEOUT) -> tuple
                 if key in seen:
                     continue
                 seen.add(key)
+                print(f"\n  [inbox: {key[:55]}]", end="", flush=True)
 
-                print(f"\n  [email found: {key[:50]}]", end="", flush=True)
-
+                captured.clear()
                 try:
-                    await page.locator(item["sel"]).nth(item["index"]).click()
-                    # Wait for email content to fully render
+                    await page.locator(item["sel"]).nth(item["i"]).click()
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=8000)
+                        await page.wait_for_load_state("networkidle", timeout=6000)
                     except Exception:
                         pass
-                    await asyncio.sleep(3)
-
-                    # Collect text from main page + all iframes
-                    combined = await page.inner_text("body")
-                    combined += "\n" + await page.content()  # raw HTML too
-                    for frame in page.frames[1:]:
-                        try:
-                            combined += "\n" + await frame.inner_text("body")
-                            combined += "\n" + await frame.content()
-                        except Exception:
-                            pass
-
-                    # 6-digit code
-                    m = re.search(r"\b(\d{6})\b", combined)
-                    if m:
-                        print()
-                        return "code", m.group(1)
-
-                    # Verification / activation link (broad match)
-                    m2 = re.search(
-                        r'https?://[^\s"\'<>]+'
-                        r'(?:verif|confirm|activ|account|click|token|magic)[^\s"\'<>]*',
-                        combined, re.IGNORECASE,
-                    )
-                    if m2:
-                        print()
-                        return "link", m2.group(0)
-
-                    # Any tacobell / yum link as last resort
-                    m3 = re.search(
-                        r'https?://[^\s"\'<>]*(?:tacobell|yum\.com)[^\s"\'<>]*',
-                        combined, re.IGNORECASE,
-                    )
-                    if m3:
-                        print()
-                        return "link", m3.group(0)
-
-                    # Didn't find a code — navigate back
-                    try:
-                        await page.go_back()
-                    except Exception:
-                        await page.goto(TEMPMAIL_URL, wait_until="domcontentloaded")
                     await asyncio.sleep(2)
 
+                    # Check captured network responses after clicking
+                    for blob in list(captured):
+                        result = _extract(blob)
+                        if result:
+                            print()
+                            return result
+
+                    # Full DOM read (page + all iframes)
+                    result = _extract(await _read_all(page))
+                    if result:
+                        print()
+                        return result
+
                 except Exception as e:
-                    print(f"\n  [error opening email: {e}]", end="", flush=True)
+                    print(f"\n  [click error: {e.__class__.__name__}]", end="", flush=True)
+
+                # Navigate back to inbox
+                try:
+                    if page.url != inbox_url:
+                        await page.go_back()
+                    else:
+                        await page.goto(TEMPMAIL_URL, wait_until="domcontentloaded")
+                except Exception:
                     try:
                         await page.goto(TEMPMAIL_URL, wait_until="domcontentloaded")
                     except Exception:
                         pass
+                await asyncio.sleep(1)
 
         except Exception:
             pass
@@ -251,12 +282,12 @@ async def main() -> None:
         print(f"  │     {email}{' ' * pad}  │")
         print("  │  3. Click CONFIRM, fill name + password, submit      │")
         print("  │                                                       │")
-        print("  │  The inbox is checked automatically every 5 seconds! │")
+        print("  │  The inbox is checked automatically every 3 seconds! │")
         print("  └──────────────────────────────────────────────────────┘")
         print()
 
         # ── Step 3: monitor temp-mail.org inbox ────────────────
-        print("[ 3 / 3 ]  Monitoring inbox (checking every 5 s, up to 5 min)...")
+        print("[ 3 / 3 ]  Monitoring inbox (checking every 3 s, up to 5 min)...")
         print()
 
         result_type, result_value = await poll_tempmail(page, email, timeout=TIMEOUT)
