@@ -1,8 +1,4 @@
-# Taco Bell Free Order Helper
-
-Automates getting a Taco Bell verification code using a disposable email — all from the terminal.
-
-## What it does
+get free taco bell from your terminal.
 
 1. Generates a disposable email address instantly
 2. Opens the Taco Bell sign-up page in your real browser
