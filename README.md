@@ -1,4 +1,4 @@
-get free taco bell from your terminal.
+GET FREE TACO BELL FROM YOUR TERMINAL.
 
 1. Generates a disposable email address instantly
 2. Opens the Taco Bell sign-up page in your real browser
